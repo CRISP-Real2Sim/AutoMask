@@ -146,7 +146,7 @@ def main(args):
         
     start_idx = int(frame_names[0].split('.')[0])
     end_idx = int(frame_names[-1].split('.')[0])
-    save_dir = f'/data3/zihanwa3/_Robotics/_data/toy_exp_msk/{seq}'
+    save_dir = f'{args.save_dir}/{seq}'
     os.makedirs(save_dir, exist_ok=True)
     save_dir = os.path.join(save_dir, text_prompt)
     os.makedirs(save_dir, exist_ok=True)
@@ -164,6 +164,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Set the base directory for the experiment.")
     
     parser.add_argument('--video_dir', type=str, default='/data3/zihanwa3/_Robotics/_data/toy_exp_im', help="Path to the base directory")
+    parser.add_argument('--save_dir', type=str, default='/data3/zihanwa3/_Robotics/_data/toy_exp_msk', help="Path to the base directory")
     parser.add_argument('--seq', type=str, required=True, help="Path to the base directory")
     parser.add_argument('--text_prompt', type=str, default='person', help="Path to the base directory")
 
