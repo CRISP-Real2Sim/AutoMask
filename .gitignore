@@ -1,10 +1,12 @@
-.vscode/
-.DS_Store
-__pycache__/
-*-checkpoint.ipynb
-.venv
-*.egg*
-build/*
-_C.*
-outputs/*
-checkpoints/*.pt
+# Ignore everything by default
+*
+
+# But track these file types
+!*.sh
+!*.py
+
+# Don't ignore .gitignore itself
+!.gitignore
+
+# Don't ignore directories (so git can traverse them)
+!*/
