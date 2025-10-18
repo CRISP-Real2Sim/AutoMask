@@ -1,172 +1,172 @@
-import requests
 
-import torch
-from PIL import Image
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-import os
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
-import cv2
-import imageio
-from sam2.build_sam import build_sam2_video_predictor
+from __future__ import annotations
+
 import argparse
-def show_mask(mask, ax, obj_id=None, random_color=False):
-    if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+from pathlib import Path
+import json
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+from sam2.build_sam import build_sam2_video_predictor
+
+
+def _select_best_box(result: dict[int, np.ndarray], scores, labels) -> tuple[np.ndarray, float, str]:
+    """Select the highest-scoring detection and normalise outputs to Python types."""
+
+    if isinstance(scores, torch.Tensor):
+        score_tensor = scores.detach().cpu()
+        best_idx = int(score_tensor.argmax().item())
+        best_score = float(score_tensor[best_idx].item())
     else:
-        cmap = plt.get_cmap("tab10")
-        cmap_idx = 0 if obj_id is None else obj_id
-        color = np.array([*cmap(cmap_idx)[:3], 0.6])
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+        score_array = np.asarray(scores)
+        best_idx = int(score_array.argmax())
+        best_score = float(score_array[best_idx])
+
+    boxes = result["boxes"]
+    if isinstance(boxes, torch.Tensor):
+        box_values = boxes.detach().cpu().numpy()
+    else:
+        box_values = np.asarray(boxes)
+
+    label_values = labels
+    if isinstance(labels, torch.Tensor):
+        label_values = labels.detach().cpu().tolist()
+    elif isinstance(labels, np.ndarray):
+        label_values = labels.tolist()
+
+    return box_values[best_idx].tolist(), best_score, label_values[best_idx]
 
 
-def show_points(coords, labels, ax, marker_size=200):
-    pos_points = coords[labels==1]
-    neg_points = coords[labels==0]
-    ax.scatter(pos_points[:, 0], pos_points[:, 1], color='green', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
-    ax.scatter(neg_points[:, 0], neg_points[:, 1], color='red', marker='*', s=marker_size, edgecolor='white', linewidth=1.25)
+def _prepare_paths(video_root: Path, seq: str, save_root: Path) -> tuple[Path, Path]:
+    seq_dir = video_root / seq
+    if not seq_dir.exists():
+        raise FileNotFoundError(f"Sequence '{seq}' not found in {video_root}")
+    save_dir = save_root / seq
+    save_dir.mkdir(parents=True, exist_ok=True)
+    return seq_dir, save_dir
 
 
-def show_box(box, ax):
-    x0, y0 = box[0], box[1]
-    w, h = box[2] - box[0], box[3] - box[1]
-    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0, 0, 0, 0), lw=2))
+def _discover_frames(seq_dir: Path) -> list[Path]:
+    frames = sorted([p for p in seq_dir.iterdir() if p.suffix.lower() in {'.jpg', '.jpeg'}], key=lambda p: int(p.stem))
+    if not frames:
+        raise FileNotFoundError(f"No JPEG frames found in {seq_dir}")
+    return frames
 
-def save_video_from_frames(frame_dir, output_path, fps=30):
-    """Save frames as a video at specified fps."""
-    frame_names = [
-        p for p in os.listdir(frame_dir)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-    ]
-    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
-    
-    # Read first frame to get dimensions
-    first_frame = cv2.imread(os.path.join(frame_dir, frame_names[0]))
-    height, width = first_frame.shape[:2]
-    
-    # Create video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    
-    # Write frames
-    for frame_name in frame_names:
-        frame_path = os.path.join(frame_dir, frame_name)
-        frame = cv2.imread(frame_path)
-        out.write(frame)
-    
-    out.release()
 
-def main(args):
-    video_dir = args.video_dir
-    seq = args.seq  
-    text_prompt = args.text_prompt
-    video_dir = video_dir.strip().rstrip('/')
-    seq = seq.strip()
+def _write_masks(video_segments: dict[int, dict[int, np.ndarray]], frame_paths: list[Path], save_dir: Path, obj_id: int, overwrite: bool) -> list[Path]:
+    written = []
+    for frame_idx in sorted(video_segments):
+        obj_map = video_segments[frame_idx]
+        if obj_id not in obj_map:
+            continue
+        if frame_idx >= len(frame_paths):
+            continue
+        mask = obj_map[obj_id]
+        frame_path = frame_paths[frame_idx]
+        out_path = save_dir / f"dyn_mask_{frame_path.stem}.npz"
+        if out_path.exists() and not overwrite:
+            continue
+        np.savez_compressed(out_path, dyn_mask=mask[np.newaxis, ...].astype(np.uint8))
+        written.append(out_path)
+    return written
 
-    # Construct the path using os.path.join()
-    print(video_dir, seq)
-    pathhhh = os.path.join(video_dir, seq, '00000.jpg')
-    print(pathhhh, 'wtfnsafkajsfaksjf')
 
-    sam2_checkpoint = "./checkpoints/sam2_hiera_large.pt"
-    model_id = "IDEA-Research/grounding-dino-tiny"
-    model_cfg = "sam2_hiera_l.yaml"
-    device = "cuda"
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Generate SAM2 masks for a sequence using a text prompt.")
+    parser.add_argument('--video_dir', type=Path, required=True, help='Directory containing per-sequence image folders')
+    parser.add_argument('--save_dir', type=Path, default=None, help='Output directory root for masks (defaults to video_dir/../sam_v2_dyn_mask)')
+    parser.add_argument('--seq', type=str, required=True, help='Sequence name (subdirectory of video_dir)')
+    parser.add_argument('--text_prompt', type=str, default='person', help='Text prompt for GroundingDINO')
+    parser.add_argument('--box_threshold', type=float, default=0.4, help='GroundingDINO box confidence threshold')
+    parser.add_argument('--text_threshold', type=float, default=0.3, help='GroundingDINO text confidence threshold')
+    parser.add_argument('--model_id', type=str, default='IDEA-Research/grounding-dino-tiny', help='GroundingDINO model identifier')
+    parser.add_argument('--sam_checkpoint', type=Path, default=Path('AutoMask/checkpoints/sam2_hiera_large.pt'), help='Path to SAM2 checkpoint')
+    parser.add_argument('--sam_config', type=str, default='sam2_hiera_l.yaml', help='SAM2 config file name')
+    parser.add_argument('--device', type=str, default='cuda', help='Torch device to run on')
+    parser.add_argument('--overwrite', action='store_true', help='Overwrite existing mask files')
+    args = parser.parse_args(argv)
 
-    predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
-    processor = AutoProcessor.from_pretrained(model_id)
-    model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
-    #  base_dir = '/data3/zihanwa3/_Robotics/_data/toy_exp_im/449_resize'
-    text_labels = [[text_prompt]]
-    image = Image.open(pathhhh)
-    inputs = processor(images=image, text=text_labels, return_tensors="pt").to(device)
+    video_root = args.video_dir.resolve()
+    save_root = args.save_dir if args.save_dir is not None else (video_root.parent / 'sam_v2_dyn_mask')
+    save_root = save_root.resolve()
+
+    seq_dir, seq_save_dir = _prepare_paths(video_root, args.seq, save_root)
+    frame_paths = _discover_frames(seq_dir)
+
+    if not args.overwrite:
+        existing = list(seq_save_dir.glob('dyn_mask_*.npz'))
+        if existing:
+            print(f"[AutoMask] Found {len(existing)} mask files in {seq_save_dir}, skipping generation.")
+            return
+
+    print(frame_paths[0], 'frame_paths[0')
+    first_frame = Image.open(frame_paths[0]).convert('RGB')
+
+    processor = AutoProcessor.from_pretrained(args.model_id)
+    detector = AutoModelForZeroShotObjectDetection.from_pretrained(args.model_id).to(args.device)
+
+    inputs = processor(images=first_frame, text=[args.text_prompt], return_tensors='pt').to(args.device)
     with torch.no_grad():
-        outputs = model(**inputs)
-
-    results = processor.post_process_grounded_object_detection(
+        outputs = detector(**inputs)
+    detections = processor.post_process_grounded_object_detection(
         outputs,
         inputs.input_ids,
-        box_threshold=0.4,
-        text_threshold=0.3,
-        target_sizes=[image.size[::-1]]
+        box_threshold=args.box_threshold,
+        text_threshold=args.text_threshold,
+        target_sizes=[first_frame.size[::-1]],
+    )[0]
+
+    if len(detections['boxes']) == 0:
+        raise RuntimeError(f"No detections found for prompt '{args.text_prompt}' in {frame_paths[0]}")
+
+    label_source = detections.get('text_labels', detections['labels'])
+    box, score, label = _select_best_box(detections, detections['scores'], label_source)
+    print(f"[AutoMask] Selected box {box} for label '{label}' (score={score:.3f})")
+
+    predictor = build_sam2_video_predictor(
+        config_file=args.sam_config,
+        ckpt_path=str(args.sam_checkpoint),
+        device=args.device,
     )
-    result = results[0]
 
-    best_box = None
-    best_score = -1
-    best_label = None
+    inference_state = predictor.init_state(video_path=str(seq_dir))
+    ann_obj_id = 1
 
-    for box, score, label in zip(result["boxes"], result["scores"], result["labels"]):
-        if score > best_score:
-            best_score = score
-            best_box = box
-            best_label = label
+    with torch.inference_mode(), torch.autocast(device_type='cuda' if args.device.startswith('cuda') else 'cpu', dtype=torch.bfloat16, enabled=args.device.startswith('cuda')):
+        _, _, _ = predictor.add_new_points_or_box(
+            inference_state=inference_state,
+            frame_idx=0,
+            obj_id=ann_obj_id,
+            box=box,
+        )
+        video_segments: dict[int, dict[int, np.ndarray]] = {}
+        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+            video_segments[out_frame_idx] = {
+                out_obj_id: (out_mask_logits[idx] > 0.0).cpu().numpy()
+                for idx, out_obj_id in enumerate(out_obj_ids)
+            }
 
-    if best_box is not None:
-        box = [round(x, 2) for x in best_box.tolist()]
-        print(f"Best detection: {best_label} with confidence {round(best_score.item(), 3)} at location {best_box}")
+    written = _write_masks(video_segments, frame_paths, seq_save_dir, ann_obj_id, args.overwrite)
+    if not written:
+        print(f"[AutoMask] No masks written for {args.seq}; consider using --overwrite.")
+        return
 
-        
-
-    video_dir = f'{video_dir}/{seq}'
-
-    frame_names = [
-        p for p in os.listdir(video_dir)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-    ]
-    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
-    
-    # Read first frame to get dimensions
-    first_frame = cv2.imread(os.path.join(video_dir, frame_names[0]))
-    h, w = first_frame.shape[:2]
-    print(f"Video dimensions: height={h}, width={w}")
-    
-    frame_idx = 0
-    inference_state = predictor.init_state(video_path=video_dir)
-
-
-    ann_frame_idx = 0  # the frame index we interact with
-    ann_obj_id = 4  # give a unique id to each object we interact with (it can be any integers)
-
-    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-        inference_state=inference_state,
-        frame_idx=ann_frame_idx,
-        obj_id=ann_obj_id,
-        box=box,
-    )
-    video_segments = {}  # video_segments contains the per-frame segmentation results
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-        video_segments[out_frame_idx] = {
-            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-            for i, out_obj_id in enumerate(out_obj_ids)
-        }
-        
-    start_idx = int(frame_names[0].split('.')[0])
-    end_idx = int(frame_names[-1].split('.')[0])
-    save_dir = f'{args.save_dir}/{seq}'
-    os.makedirs(save_dir, exist_ok=True)
-    save_dir = os.path.join(save_dir, text_prompt)
-    os.makedirs(save_dir, exist_ok=True)
-    out_video = os.path.join(save_dir, 'masks.mp4')
-    #imageio.mimsave(out_video, frames)
+    metadata = {
+        'sequence': args.seq,
+        'prompt': args.text_prompt,
+        'box': box,
+        'score': score,
+        'label': label,
+        'mask_count': len(written),
+    }
+    with (seq_save_dir / 'metadata.json').open('w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2)
+    print(f"[AutoMask] Saved {len(written)} masks to {seq_save_dir}")
 
 
-    for i in range(end_idx-start_idx+1):
-        dyn_mask=video_segments[i][4]
-        np.savez_compressed(os.path.join(save_dir, f'dyn_mask_{i+start_idx}.npz'), dyn_mask=dyn_mask)
-
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Set the base directory for the experiment.")
-    
-    parser.add_argument('--video_dir', type=str, default='/data3/zihanwa3/_Robotics/_data/toy_exp_im', help="Path to the base directory")
-    parser.add_argument('--save_dir', type=str, default='/data3/zihanwa3/_Robotics/_data/toy_exp_msk', help="Path to the base directory")
-    parser.add_argument('--seq', type=str, required=True, help="Path to the base directory")
-    parser.add_argument('--text_prompt', type=str, default='person', help="Path to the base directory")
-
-    args = parser.parse_args()
-    main(args)
+if __name__ == '__main__':
+    main()
